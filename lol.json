@@ -1,7 +1,7 @@
 {
   "id": "youtube-player-nuvio",
   "name": "YouTube",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "description": "Busca y reproduce videos de YouTube (Invidious/Piped). Solo Buscar, Biblioteca y Ajustes.",
   "author": "adaptado de stanpx/youtube-kino-plugin",
   "icon": "icon.png",
@@ -14,6 +14,12 @@
     "accent": "#FF0000",
     "background": "#0E0E0E",
     "surface": "#181818"
+  },
+  "searchImageStyle": "backdrop",
+  "searchShowTitle": true,
+  "search": {
+    "imageStyle": "backdrop",
+    "showTitle": true
   },
   "config": [
     {
