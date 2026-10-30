@@ -1630,67 +1630,195 @@ async function search(query, opts) {
   }
 }
 
-async function getMeta(id, type) {
-  const raw = String(id || "");
-  let ref = raw;
-  if (raw.startsWith("yt:video:")) ref = "video:" + raw.slice("yt:video:".length);
-  else if (raw.startsWith("yt:playlist:")) ref = "playlist:" + raw.slice("yt:playlist:".length);
-  else if (raw.startsWith("yt:channel:")) ref = "channel:" + raw.slice("yt:channel:".length);
-  else if (raw.startsWith("yt:")) ref = raw.slice(3);
 
-  // Video individual — mismo título que en el buscador
-  if (ref.startsWith("video:") || (/^[a-zA-Z0-9_-]{11}$/.test(ref))) {
-    const videoId = ref.startsWith("video:") ? ref.slice(6) : ref;
-    let title = "";
-    let overview = "";
-    let channel = "";
+async function parseYoutubeVideoId(rawId) {
+  const s = String(rawId || "").trim();
+  if (!s) return "";
+  // yt:video:ID | video:ID | yt-v-ID
+  let m = s.match(/(?:yt:video:|video:|yt-v-)([A-Za-z0-9_-]{11})/);
+  if (m) return m[1];
+  // bare 11-char id
+  if (/^[A-Za-z0-9_-]{11}$/.test(s)) return s;
+  // full URL
+  m = s.match(/(?:v=|youtu\.be\/|\/embed\/|\/shorts\/|\/vi\/)([A-Za-z0-9_-]{11})/);
+  if (m) return m[1];
+  // yt: something else that ends with 11 chars
+  m = s.match(/([A-Za-z0-9_-]{11})$/);
+  if (m && !s.includes("playlist") && !s.includes("channel")) return m[1];
+  return "";
+}
 
-    // 1) Data API
+/** oEmbed de YouTube: muy fiable para el título real sin API key */
+async function fetchTitleOEmbed(videoId) {
+  try {
+    const url = "https://www.youtube.com/oembed?url=" +
+      encodeURIComponent("https://www.youtube.com/watch?v=" + videoId) +
+      "&format=json";
+    const res = await fetch(url, {
+      headers: { "Accept": "application/json", "User-Agent": "Mozilla/5.0" }
+    });
+    if (!res.ok) return null;
+    const data = await res.json();
+    if (data && data.title) {
+      return {
+        title: String(data.title).trim(),
+        channel: String(data.author_name || "").trim(),
+        overview: ""
+      };
+    }
+  } catch (e) {
+    console.log("[YouTube] oembed:", String(e));
+  }
+  return null;
+}
+
+async function fetchVideoTitleInnertube(videoId) {
+  try {
+    const raw = await ytInnertubeFetch("player", {
+      videoId: videoId,
+      contentCheckOk: true,
+      racyCheckOk: true
+    });
+    const details = raw && raw.videoDetails;
+    if (details && details.title) {
+      return {
+        title: String(details.title).trim(),
+        overview: String(details.shortDescription || ""),
+        channel: String(details.author || "")
+      };
+    }
+  } catch (e) {
+    console.log("[YouTube] innertube title:", String(e));
+  }
+  try {
+    const raw = await ytInnertubeFetch("next", { videoId: videoId });
+    const primary = raw && raw.contents && raw.contents.twoColumnWatchNextResults
+      && raw.contents.twoColumnWatchNextResults.results
+      && raw.contents.twoColumnWatchNextResults.results.results
+      && raw.contents.twoColumnWatchNextResults.results.results.contents;
+    if (Array.isArray(primary)) {
+      for (const c of primary) {
+        const vr = c && c.videoPrimaryInfoRenderer;
+        if (vr && vr.title) {
+          const t = extractText(vr.title);
+          if (t) {
+            let channel = "";
+            const sec = primary.find(x => x && x.videoSecondaryInfoRenderer);
+            if (sec && sec.videoSecondaryInfoRenderer && sec.videoSecondaryInfoRenderer.owner) {
+              const owner = sec.videoSecondaryInfoRenderer.owner.videoOwnerRenderer;
+              channel = extractText(owner && owner.title) || "";
+            }
+            return { title: t, overview: "", channel: channel };
+          }
+        }
+      }
+    }
+  } catch (e) {
+    console.log("[YouTube] innertube next title:", String(e));
+  }
+  return null;
+}
+
+async function resolveVideoMeta(videoId) {
+  let title = "";
+  let overview = "";
+  let channel = "";
+
+  // 1) oEmbed — título real, sin API key
+  try {
+    const oe = await fetchTitleOEmbed(videoId);
+    if (oe && oe.title) {
+      title = oe.title;
+      channel = oe.channel || "";
+    }
+  } catch (_) {}
+
+  // 2) Data API
+  if (!title || !overview) {
     try {
       const data = await ytDataApiFetch("videos", { part: "snippet,contentDetails", id: videoId });
       const sn = data && data.items && data.items[0] && data.items[0].snippet;
       if (sn) {
-        title = String(sn.title || "").trim();
-        overview = sn.description || "";
-        channel = sn.channelTitle || "";
+        if (!title) title = String(sn.title || "").trim();
+        overview = overview || sn.description || "";
+        channel = channel || sn.channelTitle || "";
       }
-    } catch (e) {}
+    } catch (_) {}
+  }
 
-    // 2) Invidious si no hay título
-    if (!title) {
+  // 3) Innertube
+  if (!title) {
+    try {
+      const it = await fetchVideoTitleInnertube(videoId);
+      if (it && it.title) {
+        title = it.title;
+        overview = overview || it.overview || "";
+        channel = channel || it.channel || "";
+      }
+    } catch (_) {}
+  }
+
+  // 4) Invidious
+  if (!title) {
+    for (const inv of INVIDIOUS_MIRRORS) {
       try {
-        for (const inv of INVIDIOUS_MIRRORS) {
-          const res = await fetch(inv + "/api/v1/videos/" + videoId, {
-            headers: { Accept: "application/json", "User-Agent": "Mozilla/5.0" }
-          });
-          if (!res.ok) continue;
-          const v = await res.json();
-          title = String(v.title || "").trim();
-          overview = overview || v.description || "";
-          channel = channel || v.author || "";
-          if (title) break;
-        }
+        const res = await fetch(inv + "/api/v1/videos/" + videoId, {
+          headers: { Accept: "application/json", "User-Agent": "Mozilla/5.0" }
+        });
+        if (!res.ok) continue;
+        const v = await res.json();
+        title = String(v.title || "").trim();
+        overview = overview || v.description || "";
+        channel = channel || v.author || "";
+        if (title) break;
       } catch (_) {}
     }
+  }
 
-    // 3) Piped
-    if (!title) {
+  // 5) Piped
+  if (!title) {
+    for (const piped of PIPED_INSTANCES) {
       try {
-        for (const piped of PIPED_INSTANCES) {
-          const res = await fetch(piped + "/streams/" + videoId, {
-            headers: { Accept: "application/json", "User-Agent": "Mozilla/5.0" }
-          });
-          if (!res.ok) continue;
-          const v = await res.json();
-          title = String(v.title || "").trim();
-          overview = overview || v.description || "";
-          channel = channel || v.uploader || v.uploaderName || "";
-          if (title) break;
-        }
+        const res = await fetch(piped + "/streams/" + videoId, {
+          headers: { Accept: "application/json", "User-Agent": "Mozilla/5.0" }
+        });
+        if (!res.ok) continue;
+        const v = await res.json();
+        title = String(v.title || "").trim();
+        overview = overview || v.description || "";
+        channel = channel || v.uploader || v.uploaderName || "";
+        if (title) break;
       } catch (_) {}
     }
+  }
 
-    if (!title) title = "Video de YouTube";
+  return {
+    title: title || "",
+    overview: overview || "",
+    channel: channel || ""
+  };
+}
+
+async function getMeta(id, type) {
+  const raw = String(id || "");
+  let ref = raw;
+
+  // Normalizar ids que manda la app / el buscador
+  if (raw.startsWith("yt:video:")) ref = "video:" + raw.slice("yt:video:".length);
+  else if (raw.startsWith("yt-v-")) ref = "video:" + raw.slice("yt-v-".length);
+  else if (raw.startsWith("yt:playlist:")) ref = "playlist:" + raw.slice("yt:playlist:".length);
+  else if (raw.startsWith("yt-pl-")) ref = "playlist:" + raw.slice("yt-pl-".length);
+  else if (raw.startsWith("yt:channel:")) ref = "channel:" + raw.slice("yt:channel:".length);
+  else if (raw.startsWith("yt-ch-")) ref = "channel:" + raw.slice("yt-ch-".length);
+  else if (raw.startsWith("yt:")) ref = raw.slice(3);
+
+  // Video individual — título real (mismo que en resultados de búsqueda)
+  const videoId = parseYoutubeVideoId(ref) || parseYoutubeVideoId(raw);
+  if (videoId && videoId.length === 11 && !ref.startsWith("playlist:") && !ref.startsWith("channel:")) {
+    const meta = await resolveVideoMeta(videoId);
+    const title = meta.title || ("YouTube " + videoId);
+    const overview = meta.overview || "";
+    const channel = meta.channel || "";
 
     return {
       id: "yt:video:" + videoId,
@@ -1702,6 +1830,7 @@ async function getMeta(id, type) {
       description: overview,
       type: "movie",
       media_type: "movie",
+      year: null,
       extra: {
         ref: "video:" + videoId,
         channel: channel,
