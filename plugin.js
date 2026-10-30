@@ -1542,23 +1542,28 @@ function mapToNuvioItem(item) {
   const ref = String(item.ref || item.id || "");
   let type = "movie";
   let id = ref;
-  let tmdbId = null;
 
-  if (ref.startsWith("video:") || ref.startsWith("yt-v-")) {
-    const vid = ref.replace(/^video:/, "").replace(/^yt-v-/, "");
+  // Título exactamente el de la búsqueda (no genéricos)
+  const title = String(item.title || item.name || "").trim() || "YouTube";
+
+  if (ref.startsWith("video:") || ref.startsWith("yt-v-") || (item.id && String(item.id).startsWith("yt-v-"))) {
+    const vid = ref.replace(/^video:/, "").replace(/^yt-v-/, "") || String(item.id || "").replace(/^yt-v-/, "");
     id = "yt:video:" + vid;
-    type = "movie";
-  } else if (ref.startsWith("playlist:") || (item.kind === "series" && ref.indexOf("playlist") !== -1)) {
-    const pid = ref.replace(/^playlist:/, "");
+    type = item.kind === "live" ? "channel" : "movie";
+  } else if (ref.startsWith("playlist:") || (item.kind === "series" && String(ref).indexOf("playlist") !== -1) || (item.id && String(item.id).startsWith("yt-pl-"))) {
+    const pid = ref.replace(/^playlist:/, "") || String(item.id || "").replace(/^yt-pl-/, "");
     id = "yt:playlist:" + pid;
     type = "tv";
-  } else if (ref.startsWith("channel:")) {
-    const cid = ref.replace(/^channel:/, "");
+  } else if (ref.startsWith("channel:") || (item.id && String(item.id).startsWith("yt-ch-"))) {
+    const cid = ref.replace(/^channel:/, "") || String(item.id || "").replace(/^yt-ch-/, "");
     id = "yt:channel:" + cid;
     type = "tv";
   } else if (item.kind === "series") {
     id = "yt:" + ref;
     type = "tv";
+  } else if (item.kind === "live") {
+    id = "yt:" + (ref || item.id || Math.random().toString(36).slice(2));
+    type = "channel";
   } else {
     id = "yt:" + (ref || item.id || Math.random().toString(36).slice(2));
     type = "movie";
@@ -1566,17 +1571,24 @@ function mapToNuvioItem(item) {
 
   return {
     id: id,
-    title: item.title || item.name || "YouTube",
-    name: item.title || item.name || "YouTube",
+    title: title,
+    name: title,
     poster: item.poster || item.still || null,
-    backdrop: item.backdrop || item.poster || null,
+    backdrop: item.backdrop || item.poster || item.still || null,
     overview: item.overview || item.description || "",
     description: item.overview || item.description || "",
     type: type,
     media_type: type,
     year: item.year || null,
     rating: item.rating || null,
-    extra: { ref: ref, youtube: true, kind: item.kind || type }
+    // Guardamos el título de búsqueda para que ficha/player lo reutilicen
+    extra: {
+      ref: ref,
+      youtube: true,
+      kind: item.kind || type,
+      searchTitle: title,
+      originalTitle: title
+    }
   };
 }
 
@@ -1626,21 +1638,26 @@ async function getMeta(id, type) {
   else if (raw.startsWith("yt:channel:")) ref = "channel:" + raw.slice("yt:channel:".length);
   else if (raw.startsWith("yt:")) ref = raw.slice(3);
 
-  // Video individual
+  // Video individual — mismo título que en el buscador
   if (ref.startsWith("video:") || (/^[a-zA-Z0-9_-]{11}$/.test(ref))) {
     const videoId = ref.startsWith("video:") ? ref.slice(6) : ref;
-    let title = "Video de YouTube";
+    let title = "";
     let overview = "";
     let channel = "";
+
+    // 1) Data API
     try {
       const data = await ytDataApiFetch("videos", { part: "snippet,contentDetails", id: videoId });
       const sn = data && data.items && data.items[0] && data.items[0].snippet;
       if (sn) {
-        title = sn.title || title;
+        title = String(sn.title || "").trim();
         overview = sn.description || "";
         channel = sn.channelTitle || "";
       }
-    } catch (e) {
+    } catch (e) {}
+
+    // 2) Invidious si no hay título
+    if (!title) {
       try {
         for (const inv of INVIDIOUS_MIRRORS) {
           const res = await fetch(inv + "/api/v1/videos/" + videoId, {
@@ -1648,13 +1665,33 @@ async function getMeta(id, type) {
           });
           if (!res.ok) continue;
           const v = await res.json();
-          title = v.title || title;
-          overview = v.description || "";
-          channel = v.author || "";
-          break;
+          title = String(v.title || "").trim();
+          overview = overview || v.description || "";
+          channel = channel || v.author || "";
+          if (title) break;
         }
       } catch (_) {}
     }
+
+    // 3) Piped
+    if (!title) {
+      try {
+        for (const piped of PIPED_INSTANCES) {
+          const res = await fetch(piped + "/streams/" + videoId, {
+            headers: { Accept: "application/json", "User-Agent": "Mozilla/5.0" }
+          });
+          if (!res.ok) continue;
+          const v = await res.json();
+          title = String(v.title || "").trim();
+          overview = overview || v.description || "";
+          channel = channel || v.uploader || v.uploaderName || "";
+          if (title) break;
+        }
+      } catch (_) {}
+    }
+
+    if (!title) title = "Video de YouTube";
+
     return {
       id: "yt:video:" + videoId,
       title: title,
@@ -1665,7 +1702,13 @@ async function getMeta(id, type) {
       description: overview,
       type: "movie",
       media_type: "movie",
-      extra: { ref: "video:" + videoId, channel: channel, youtube: true }
+      extra: {
+        ref: "video:" + videoId,
+        channel: channel,
+        youtube: true,
+        searchTitle: title,
+        originalTitle: title
+      }
     };
   }
 
@@ -1704,7 +1747,12 @@ async function getMeta(id, type) {
           episodeCount: eps.length,
           episodes: eps
         }],
-        extra: { ref: ref, youtube: true }
+        extra: {
+          ref: ref,
+          youtube: true,
+          searchTitle: seriesTitle,
+          originalTitle: seriesTitle
+        }
       };
     } catch (e) {
       return { id: raw, title: "YouTube", overview: String(e), type: "tv" };
