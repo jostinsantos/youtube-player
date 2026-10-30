@@ -1,0 +1,42 @@
+{
+  "id": "youtube-player-nuvio",
+  "name": "YouTube",
+  "version": "1.0.1",
+  "description": "Busca y reproduce videos de YouTube (Invidious/Piped). Solo Buscar, Biblioteca y Ajustes.",
+  "author": "adaptado de stanpx/youtube-kino-plugin",
+  "icon": "icon.png",
+  "logo": "icon.png",
+  "entry": "plugin.js",
+  "capabilities": ["search", "meta", "streams"],
+  "tabs": ["search", "library", "settings"],
+  "languages": ["es", "en"],
+  "theme": {
+    "accent": "#FF0000",
+    "background": "#0E0E0E",
+    "surface": "#181818"
+  },
+  "config": [
+    {
+      "key": "api_key",
+      "label": "YouTube Data API v3 Key (opcional)",
+      "type": "password",
+      "description": "Clave AIzaSy... de Google Cloud. Sin ella usa Invidious/Piped.",
+      "default": "",
+      "placeholder": "AIzaSy..."
+    },
+    {
+      "key": "region_code",
+      "label": "Código de región (ISO)",
+      "type": "text",
+      "default": "MX",
+      "placeholder": "MX, ES, AR, US"
+    },
+    {
+      "key": "preferred_lang",
+      "label": "Idioma preferido",
+      "type": "text",
+      "default": "es",
+      "placeholder": "es, es-419, en"
+    }
+  ]
+}
