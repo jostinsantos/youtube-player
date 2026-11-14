@@ -1837,6 +1837,50 @@ function formatDurationClock(seconds) {
   return m + ":" + pad(s);
 }
 
+function formatCount(n) {
+  n = Number(n) || 0;
+  if (n >= 1000000) return (Math.round(n / 100000) / 10) + " M";
+  if (n >= 1000) return (Math.round(n / 100) / 10) + " K";
+  return String(Math.floor(n));
+}
+
+function formatPublishedDate(iso) {
+  if (!iso) return "";
+  var d = new Date(iso);
+  if (isNaN(d.getTime())) {
+    // already a relative string like "hace 2 días"
+    return String(iso);
+  }
+  var day = d.getDate();
+  var month = d.getMonth() + 1;
+  var year = d.getFullYear();
+  function pad(x) { return (x < 10 ? "0" : "") + x; }
+  return pad(day) + "/" + pad(month) + "/" + year;
+}
+
+function stripCanalPrefix(text) {
+  return String(text || "")
+    .replace(/^Canal:\s*.+$/gmi, "")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
+function buildVideoDescription(stats, originalDesc) {
+  var lines = [];
+  if (stats) {
+    if (stats.publishedText) lines.push("📅 Publicado: " + stats.publishedText);
+    if (stats.viewsText) lines.push("👁 Visualizaciones: " + stats.viewsText);
+    if (stats.likesText) lines.push("👍 Likes: " + stats.likesText);
+  }
+  var body = stripCanalPrefix(originalDesc || "");
+  // no repetir el canal dentro de la descripción
+  if (body) {
+    if (lines.length) lines.push("");
+    lines.push(body);
+  }
+  return lines.join("\n").trim();
+}
+
 function formatDurationText(seconds) {
   seconds = normalizeDurationSeconds(seconds);
   if (!seconds) return "";
@@ -1849,11 +1893,125 @@ function formatDurationText(seconds) {
 }
 
 
+
+/** Stats + descripción desde endpoint /next (más fiable que player) */
+async function fetchVideoStatsFromNext(videoId) {
+  try {
+    const raw = await ytInnertubeFetch("next", { videoId: videoId });
+    const out = { title: "", overview: "", channel: "", duration: 0, viewCount: 0, likeCount: 0, publishedAt: "", viewsText: "", likesText: "", publishedText: "" };
+    if (!raw) return out;
+
+    // Recorrido superficial de contents
+    const primary = raw.contents
+      && raw.contents.twoColumnWatchNextResults
+      && raw.contents.twoColumnWatchNextResults.results
+      && raw.contents.twoColumnWatchNextResults.results.results
+      && raw.contents.twoColumnWatchNextResults.results.results.contents;
+
+    if (Array.isArray(primary)) {
+      for (const c of primary) {
+        const vpi = c && c.videoPrimaryInfoRenderer;
+        if (vpi) {
+          out.title = extractText(vpi.title) || out.title;
+          // vistas
+          const vc = vpi.viewCount && vpi.viewCount.videoViewCountRenderer;
+          if (vc) {
+            out.viewsText = extractText(vc.viewCount) || extractText(vc.shortViewCount) || "";
+            const digits = String(out.viewsText).replace(/[^\d]/g, "");
+            if (digits) out.viewCount = Number(digits) || 0;
+          }
+          // fecha
+          out.publishedText = extractText(vpi.dateText) || extractText(vpi.relativeDateText) || out.publishedText;
+          // factoids: likes etc
+          const facts = vpi.factoid || [];
+          for (const f of facts) {
+            const fr = f && f.factoidRenderer;
+            if (!fr) continue;
+            const label = extractText(fr.label).toLowerCase();
+            const value = extractText(fr.value);
+            if (/like|me gusta|pulgar/i.test(label) || /K|M|\d/.test(value) && /like/i.test(label + value)) {
+              out.likesText = value;
+              // 4,4 K → approx
+              var n = value.replace(",", ".").replace(/[^\d.]/g, "");
+              var num = parseFloat(n) || 0;
+              if (/m/i.test(value)) num *= 1000000;
+              else if (/k/i.test(value)) num *= 1000;
+              out.likeCount = Math.round(num);
+            }
+          }
+        }
+        const vsi = c && c.videoSecondaryInfoRenderer;
+        if (vsi) {
+          const owner = vsi.owner && vsi.owner.videoOwnerRenderer;
+          if (owner) out.channel = extractText(owner.title) || out.channel;
+          // descripción
+          const desc = vsi.attributedDescription
+            || vsi.description
+            || (vsi.attributedDescriptionBodyText && { content: vsi.attributedDescriptionBodyText.content });
+          if (desc) {
+            if (typeof desc.content === "string") out.overview = desc.content;
+            else out.overview = extractText(desc) || out.overview;
+          }
+          if (!out.overview && vsi.attributedDescriptionBodyText && vsi.attributedDescriptionBodyText.content) {
+            out.overview = String(vsi.attributedDescriptionBodyText.content);
+          }
+        }
+      }
+    }
+
+    // microformat
+    const micro = raw.microformat && (raw.microformat.playerMicroformatRenderer || raw.microformat.microformatDataRenderer);
+    if (micro) {
+      if (!out.publishedAt && micro.publishDate) out.publishedAt = micro.publishDate;
+      if (!out.publishedAt && micro.uploadDate) out.publishedAt = micro.uploadDate;
+      if (!out.overview && micro.description) out.overview = extractText(micro.description) || String(micro.description.simpleText || "");
+    }
+
+    // fallback regex sobre el JSON completo
+    if (!out.viewsText || !out.overview) {
+      const s = JSON.stringify(raw);
+      if (!out.viewsText) {
+        const m = s.match(/"viewCount"\s*:\s*\{\s*"simpleText"\s*:\s*"([^"]+)"/);
+        if (m) out.viewsText = m[1];
+      }
+      if (!out.overview) {
+        const m2 = s.match(/"attributedDescriptionBodyText"\s*:\s*\{\s*"content"\s*:\s*"((?:\\.|[^"\\])*)"/);
+        if (m2) {
+          try { out.overview = JSON.parse('"' + m2[1] + '"'); } catch (_) { out.overview = m2[1]; }
+        }
+      }
+      if (!out.publishedText) {
+        const m3 = s.match(/"dateText"\s*:\s*\{\s*"simpleText"\s*:\s*"([^"]+)"/);
+        if (m3) out.publishedText = m3[1];
+      }
+      if (!out.likeCount) {
+        const m4 = s.match(/"value"\s*:\s*\{\s*"simpleText"\s*:\s*"([^"]+)"\s*\}\s*,\s*"label"\s*:\s*\{\s*"simpleText"\s*:\s*"(?:likes|Me gusta|me gusta)"/i);
+        if (m4) {
+          out.likesText = m4[1];
+          var n2 = m4[1].replace(",", ".").replace(/[^\d.]/g, "");
+          var num2 = parseFloat(n2) || 0;
+          if (/m/i.test(m4[1])) num2 *= 1e6;
+          else if (/k/i.test(m4[1])) num2 *= 1e3;
+          out.likeCount = Math.round(num2);
+        }
+      }
+    }
+
+    return out;
+  } catch (e) {
+    console.log("[YouTube] next stats:", String(e));
+    return null;
+  }
+}
+
 async function resolveVideoMeta(videoId) {
   let title = "";
-  let overview = "";
+  let overview = ""; // descripción ORIGINAL del video (sin "Canal:")
   let channel = "";
-  let duration = 0; // siempre en segundos
+  let duration = 0; // siempre en segundos internos
+  let viewCount = 0;
+  let likeCount = 0;
+  let publishedAt = "";
   let poster = "https://i.ytimg.com/vi/" + videoId + "/hqdefault.jpg";
   let backdrop = "https://i.ytimg.com/vi/" + videoId + "/maxresdefault.jpg";
 
@@ -1879,19 +2037,46 @@ async function resolveVideoMeta(videoId) {
     }
   } catch (_) {}
 
+  // 1b) /next — descripción, vistas, likes, fecha (más fiable que player)
+  try {
+    const nx = await fetchVideoStatsFromNext(videoId);
+    if (nx) {
+      if (!title && nx.title) title = nx.title;
+      if (nx.overview) overview = nx.overview;
+      if (nx.channel) channel = channel || nx.channel;
+      if (nx.viewCount) viewCount = nx.viewCount;
+      if (nx.viewsText) { /* keep for build */ }
+      if (nx.likeCount) likeCount = nx.likeCount;
+      if (nx.publishedText) publishedAt = publishedAt || nx.publishedText;
+      if (nx.publishedAt) publishedAt = nx.publishedAt || publishedAt;
+      // guardar textos legibles en variables locales vía publishedAt string
+      if (nx.viewsText && !viewCount) {
+        var d = String(nx.viewsText).replace(/[^\d]/g, "");
+        if (d) viewCount = Number(d) || 0;
+      }
+      // duration a veces no viene en next; se completa abajo
+    }
+  } catch (_) {}
+
   // 2) Data API
-  if (!title || !overview || !duration) {
+  if (!title || !overview || !duration || !viewCount) {
     try {
-      const data = await ytDataApiFetch("videos", { part: "snippet,contentDetails", id: videoId });
+      const data = await ytDataApiFetch("videos", { part: "snippet,contentDetails,statistics", id: videoId });
       const item = data && data.items && data.items[0];
       const sn = item && item.snippet;
       if (sn) {
         if (!title) title = String(sn.title || "").trim();
         overview = overview || sn.description || "";
         channel = channel || sn.channelTitle || "";
+        if (!publishedAt && sn.publishedAt) publishedAt = sn.publishedAt;
       }
       if (!duration && item && item.contentDetails && item.contentDetails.duration) {
         duration = normalizeDurationSeconds(parseIso8601Duration(item.contentDetails.duration));
+      }
+      const st = item && item.statistics;
+      if (st) {
+        if (!viewCount && st.viewCount) viewCount = Number(st.viewCount) || 0;
+        if (!likeCount && st.likeCount) likeCount = Number(st.likeCount) || 0;
       }
     } catch (_) {}
   }
@@ -1908,8 +2093,8 @@ async function resolveVideoMeta(videoId) {
       }
     } catch (_) {}
   }
-  // 3b) player directo WEB para lengthSeconds
-  if (!duration) {
+  // 3b) player directo WEB para lengthSeconds + views
+  if (!duration || !title || !viewCount) {
     try {
       const raw = await ytInnertubeFetch("player", {
         videoId: videoId,
@@ -1922,6 +2107,12 @@ async function resolveVideoMeta(videoId) {
         if (!channel && vd.author) channel = String(vd.author).trim();
         if (!overview && vd.shortDescription) overview = String(vd.shortDescription);
         if (vd.lengthSeconds) duration = normalizeDurationSeconds(vd.lengthSeconds);
+        if (!viewCount && vd.viewCount) viewCount = Number(vd.viewCount) || 0;
+      }
+      const micro = raw && raw.microformat && raw.microformat.playerMicroformatRenderer;
+      if (micro) {
+        if (!publishedAt && micro.publishDate) publishedAt = micro.publishDate;
+        if (!publishedAt && micro.uploadDate) publishedAt = micro.uploadDate;
       }
     } catch (_) {}
   }
@@ -1939,6 +2130,9 @@ async function resolveVideoMeta(videoId) {
         overview = overview || v.description || "";
         channel = channel || v.author || "";
         if (!duration && v.lengthSeconds) duration = normalizeDurationSeconds(v.lengthSeconds);
+        if (!viewCount && (v.viewCount || v.views)) viewCount = Number(v.viewCount || v.views) || 0;
+        if (!likeCount && v.likeCount) likeCount = Number(v.likeCount) || 0;
+        if (!publishedAt && (v.published || v.publishedText)) publishedAt = v.published || v.publishedText;
         if (title && duration) break;
       } catch (_) {}
     }
@@ -1957,6 +2151,9 @@ async function resolveVideoMeta(videoId) {
         overview = overview || v.description || "";
         channel = channel || v.uploader || v.uploaderName || "";
         if (!duration && v.duration) duration = normalizeDurationSeconds(v.duration);
+        if (!viewCount && (v.views || v.viewCount)) viewCount = Number(v.views || v.viewCount) || 0;
+        if (!likeCount && (v.likes || v.likeCount)) likeCount = Number(v.likes || v.likeCount) || 0;
+        if (!publishedAt && (v.uploadDate || v.uploadedDate || v.uploaded)) publishedAt = v.uploadDate || v.uploadedDate || String(v.uploaded || "");
         if (title && duration) break;
       } catch (_) {}
     }
@@ -1974,18 +2171,76 @@ async function resolveVideoMeta(videoId) {
     } catch (_) {}
   }
 
-  if (title && !overview && channel) overview = "Canal: " + channel;
+  // 7) Duración vía búsqueda por ID (lengthText "11:13") si aún falta
+  if (!duration) {
+    try {
+      const searchRaw = await ytInnertubeFetch("search", { query: videoId });
+      const found = [];
+      collectInnertubeRenderers(searchRaw, found);
+      for (const entry of found) {
+        if (entry.type === "video" && entry.data && entry.data.videoId === videoId) {
+          const lt = extractText(entry.data.lengthText);
+          duration = normalizeDurationSeconds(parseClockDuration(lt));
+          break;
+        }
+      }
+      // si no exact match, primer video con length
+      if (!duration) {
+        for (const entry of found) {
+          if (entry.type === "video" && entry.data) {
+            const lt = extractText(entry.data.lengthText);
+            const sec = normalizeDurationSeconds(parseClockDuration(lt));
+            if (sec) { duration = sec; break; }
+          }
+        }
+      }
+    } catch (_) {}
+  }
+
+  // Descripción limpia: NUNCA meter el canal aquí (va en "dirigido por")
+  overview = stripCanalPrefix(overview);
 
   duration = normalizeDurationSeconds(duration);
+  var publishedText = "";
+  if (publishedAt && !/^\d{4}-/.test(String(publishedAt)) && !/^\d{9,13}$/.test(String(publishedAt))) {
+    // ya es texto legible: "11 nov 2026" / "hace 3 días"
+    publishedText = String(publishedAt);
+  } else {
+    publishedText = formatPublishedDate(publishedAt);
+  }
+  if (!publishedText && publishedAt && /^\d{9,13}$/.test(String(publishedAt))) {
+    var ms = Number(publishedAt);
+    if (ms < 1e12) ms *= 1000;
+    publishedText = formatPublishedDate(new Date(ms).toISOString());
+  }
+  var viewsText = viewCount > 0 ? formatCount(viewCount) : "";
+  var likesText = likeCount > 0 ? formatCount(likeCount) : "";
+  var description = buildVideoDescription(
+    { publishedText: publishedText, viewsText: viewsText, likesText: likesText },
+    overview
+  );
+
+  // Minutos para la ficha (la app trata `duration` como minutos → si le pasamos segundos salen horas)
+  var durationMinutes = duration > 0 ? Math.max(1, Math.round(duration / 60)) : 0;
+
   return {
     title: title || ("YouTube " + videoId),
-    overview: overview || "",
+    overview: description,
+    descriptionRaw: overview,
     channel: channel || "",
     poster: poster,
     backdrop: backdrop || poster,
-    duration: duration, // segundos
+    durationSeconds: duration,
+    durationMinutes: durationMinutes,
+    duration: durationMinutes, // lo que muestra la ficha: MINUTOS
     durationText: formatDurationText(duration),
-    durationClock: formatDurationClock(duration)
+    durationClock: formatDurationClock(duration),
+    viewCount: viewCount,
+    likeCount: likeCount,
+    publishedAt: publishedAt || "",
+    publishedText: publishedText || "",
+    viewsText: viewsText,
+    likesText: likesText
   };
 }
 
@@ -2007,7 +2262,8 @@ async function getMeta(id, type) {
   if (videoId && videoId.length === 11 && !ref.startsWith("playlist:") && !ref.startsWith("channel:")) {
     const meta = await resolveVideoMeta(videoId);
     const title = meta.title || ("YouTube " + videoId);
-    const overview = meta.overview || (meta.channel ? ("Canal: " + meta.channel) : "");
+    // overview ya viene con stats + descripción original (sin repetir canal)
+    const overview = meta.overview || "";
     const channel = meta.channel || "";
     const poster = meta.poster || ("https://i.ytimg.com/vi/" + videoId + "/hqdefault.jpg");
     const backdrop = meta.backdrop || ("https://i.ytimg.com/vi/" + videoId + "/maxresdefault.jpg");
@@ -2022,9 +2278,9 @@ async function getMeta(id, type) {
       extra: { channel: channel }
     });
 
-    // Campos extra para ficha/player (la extracción de streams NO se toca)
-    // duration SIEMPRE en segundos enteros (ej. 673 = 11m 13s). NO milisegundos.
-    var durationSec = normalizeDurationSeconds(meta.duration);
+    // duration en MINUTOS (la ficha de la app lo muestra como tiempo de película)
+    var durationMin = meta.durationMinutes || (meta.durationSeconds ? Math.max(1, Math.round(meta.durationSeconds / 60)) : 0);
+    var durationSec = meta.durationSeconds || 0;
     var durationText = meta.durationText || formatDurationText(durationSec);
     var durationClock = meta.durationClock || formatDurationClock(durationSec);
     var creator = channel || "";
@@ -2041,27 +2297,29 @@ async function getMeta(id, type) {
       image: poster,
       backdrop: backdrop,
       background: backdrop,
+      // Descripción: stats + texto original. Canal NO va aquí.
       overview: overview,
       description: overview,
       plot: overview,
       type: "movie",
       media_type: "movie",
-      year: null,
-      // Duración real en segundos (la app debe tratarla como segundos, no ms)
-      duration: durationSec || null,
-      runtime: durationSec || null,
+      year: meta.publishedText ? String(meta.publishedText).slice(-4) : null,
+      // Ficha: minutos (evita el bug de horas enormes)
+      duration: durationMin || null,
+      runtime: durationMin || null,
+      durationSeconds: durationSec || null,
       durationText: durationText || null,
       durationClock: durationClock || null,
-      // Creador / canal
+      // Creador / canal → solo "dirigido por" / studio (una vez)
       studio: creator || null,
-      network: creator || null,
+      network: null,
       creator: creator || null,
       author: creator || null,
       channel: creator || null,
-      genres: creator ? [creator] : [],
-      // Algunas UIs leen "actors" o "cast" para mostrar crédito
+      director: creator || null,
+      genres: [],
       actors: creator ? [{ name: creator, character: "Canal" }] : [],
-      cast: creator ? creator : null,
+      cast: null,
       extra: {
         ref: "video:" + videoId,
         channel: creator,
@@ -2070,8 +2328,12 @@ async function getMeta(id, type) {
         searchTitle: title,
         originalTitle: title,
         videoId: videoId,
-        duration: durationSec,
-        durationText: durationText
+        duration: durationMin,
+        durationSeconds: durationSec,
+        durationText: durationText,
+        views: meta.viewCount || 0,
+        likes: meta.likeCount || 0,
+        published: meta.publishedText || ""
       }
     };
   }
